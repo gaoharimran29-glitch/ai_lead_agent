@@ -4,9 +4,9 @@ An end-to-end AI agent that monitors PropTech news in real time, identifies high
 
 ---
 
-![image1](image1.png)
+![image1](image2.png)
 
-![image2](image2.png)
+![image2](image1.png)
 
 ## What It Does
 
