@@ -235,4 +235,4 @@ def monitor_signals() -> list:
     save_seen(seen)
 
     print(f"✅ Total signals this run: {len(signals)}")
-    return signals[:10]
+    return signals
