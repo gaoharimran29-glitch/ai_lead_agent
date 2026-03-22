@@ -1,253 +1,133 @@
 import pandas as pd
 from datetime import datetime
-from langgraph.graph import StateGraph, END
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
+
 from source.news_finder import monitor_signals
 from agents.intent_classifier import classify_signal, generate_email
 from agents.contact_finder import find_linkedin_contact, load_cache, save_cache, find_contact_email
-from typing import TypedDict, List, Dict, Optional
 
 
 # ---------------------------
-# Graph State
-# ---------------------------
-
-class LeadState(TypedDict):
-    signals: List[Dict]
-    current_signal: Optional[Dict]
-    intent_result: Optional[object]
-    contact: Optional[Dict]
-    email_draft: Optional[Dict]       # {"subject": ..., "body": ...}
-    leads: List[Dict]
-
-
-# ---------------------------
-# STEP 1 — Fetch Signals
-# ---------------------------
-
-def fetch_signals(state: LeadState):
-    try:
-        signals = monitor_signals()
-        print(f"📡 Fetched {len(signals)} signals")
-    except Exception as e:
-        print(f"❌ Signal fetch failed: {e}")
-        signals = []
-
-    return {
-        "signals": signals,
-        "leads": []
-    }
-
-
-# ---------------------------
-# STEP 2 — Get Next Signal
-# ---------------------------
-
-def get_next_signal(state: LeadState):
-    signals = state.get("signals", [])
-
-    if not signals:
-        # Do NOT reset leads here — preserve accumulated leads list
-        return {
-            "current_signal": None,
-            "signals": [],
-            "intent_result": None,
-            "contact": None,
-            "email_draft": None
-        }
-
-    return {
-        # Do NOT include leads key here — omitting it preserves existing value in state
-        "current_signal": signals[0],
-        "signals": signals[1:],
-        "intent_result": None,
-        "contact": None,
-        "email_draft": None
-    }
-
-
-def next_signal_router(state: LeadState):
-    if not state.get("signals") and state.get("current_signal") is None:
-        return "export_excel"
-    if not state.get("current_signal"):
-        return "export_excel"
-    return "classify"
-
-
-# ---------------------------
-# STEP 3 — LLM Classification
-# ---------------------------
-
-def classify(state: LeadState):
-    signal = state["current_signal"]
-
-    text = f"""
-    Title: {signal['Title']}
-    Summary: {signal['Summary']}
-    """
-
-    try:
-        result = classify_signal(text)
-    except Exception as e:
-        print(f"❌ Classification error: {e}")
-        result = None
-
-    return {"intent_result": result}
-
-
-def intent_router(state: LeadState):
-    result = state.get("intent_result")
-
-    if result is None:
-        return "skip"
-
-    if result.intent == "YES":
-        return "find_contact"
-
-    return "skip"
-
-
-# ---------------------------
-# STEP 4 — Find Contact
+# Contact Cache — loaded once at startup
 # ---------------------------
 
 CONTACT_CACHE = load_cache()
 
 
-def find_contact(state: LeadState):
-    result = state.get("intent_result")
-    company = getattr(result, "company_name", "").strip().lower()
+# ---------------------------
+# Per-Signal Pipeline
+# Processes one signal completely: classify → contact → email → lead dict
+# This function runs in parallel across all signals.
+# ---------------------------
 
-    if not company or company == "unknown":
-        print("⚠️ No valid company name, skipping contact search")
-        return {"contact": {}}
+def process_signal(signal: dict) -> dict | None:
+    """
+    Full pipeline for a single signal.
+    Returns a lead dict if signal is YES, otherwise None.
+    Runs independently — safe to call from multiple threads.
+    """
 
-    # Cache hit
+    title   = signal.get("Title", "")
+    summary = signal.get("Summary", "")
+
+    print(f"\n⚡ Processing: {title[:60]}")
+
+    # ── Step 1: Classify ──────────────────────────────────────────
+    text   = f"Title: {title}\nSummary: {summary}"
+    result = classify_signal(text)
+
+    print(f"   Intent: {result.intent} | Company: {result.company_name} | Score: {result.urgency}")
+
+    # Only continue for strong buying signals
+    if result.intent != "YES" or result.company_name.upper() == "UNKNOWN":
+        print(f"   ↩ Skipped ({result.intent})")
+        return None
+
+    company = result.company_name.strip().lower()
+
+    # ── Step 2: Find Contact ──────────────────────────────────────
+    # Check cache first — avoids redundant searches
     if company in CONTACT_CACHE:
-        print(f"✅ Cache hit for: {company}")
-        return {"contact": CONTACT_CACHE[company]}
-
-    # Find LinkedIn contact
-    try:
-        contact = find_linkedin_contact(company)
-    except Exception as e:
-        print(f"❌ LinkedIn search failed: {e}")
-        contact = {"name": "Not Found", "title": "", "linkedin": "", "website": ""}
-
-    # Find email via pattern + Hunter verification
-    name = contact.get("name", "")
-    website = contact.get("website", "")
-    email, confidence = "", 0
-
-    if name and name != "Not Found" and website and len(name.split()) >= 2:
+        print(f"   ✅ Cache hit: {company}")
+        contact = CONTACT_CACHE[company]
+    else:
         try:
-            email, confidence = find_contact_email(name, website)
+            contact = find_linkedin_contact(company)
         except Exception as e:
-            print(f"❌ Email lookup failed: {e}")
+            print(f"   ❌ LinkedIn search failed: {e}")
+            contact = {"name": "Not Found", "title": "", "linkedin": "", "website": ""}
 
-    full_contact = {
-        **contact,
-        "email": email,
-        "confidence": confidence
-    }
+        # Find email
+        name    = contact.get("name", "")
+        website = contact.get("website", "")
+        email, confidence = "", 0
 
-    # Persist to cache
-    CONTACT_CACHE[company] = full_contact
-    save_cache(CONTACT_CACHE)
+        if name and name != "Not Found" and website and len(name.split()) >= 2:
+            try:
+                email, confidence = find_contact_email(name, website)
+            except Exception as e:
+                print(f"   ❌ Email lookup failed: {e}")
 
-    return {"contact": full_contact}
+        contact = {**contact, "email": email, "confidence": confidence}
 
+        # Write to cache immediately so other threads benefit
+        # Use a simple assignment — dict writes in CPython are thread-safe
+        # for single key updates due to the GIL
+        CONTACT_CACHE[company] = contact
 
-# ---------------------------
-# STEP 5 — Generate Email
-# ---------------------------
-
-# Always generate email after finding contact — no confidence gate.
-# Even low-confidence emails get a draft so the user can review and send manually.
-
-def generate_email_node(state: LeadState):
-    contact = state.get("contact", {})
-    result = state.get("intent_result")
-
-    company  = getattr(result, "company_name", "") or "Unknown Company"
-    name     = contact.get("name", "") or "there"
-    title    = contact.get("title", "") or "Leader"
-    summary  = getattr(result, "signal_summary", "") or ""
-    score    = getattr(result, "urgency", 0)
-
+    # ── Step 3: Generate Email ────────────────────────────────────
     lead_data = {
-        "Company Name":   company,
-        "Contact Name":   name,
-        "Title":          title,
-        "Signal Summary": summary,
-        "Intent Score":   score
+        "Company Name":   result.company_name,
+        "Contact Name":   contact.get("name", "") or "there",
+        "Title":          contact.get("title", "") or "Leader",
+        "Signal Summary": result.signal_summary or "",
+        "Intent Score":   result.urgency,
     }
 
     try:
         email_draft = generate_email(lead_data)
-        print(f"📧 Email drafted for {name} @ {company}")
     except Exception as e:
-        print(f"❌ Email generation failed: {e}")
+        print(f"   ❌ Email generation failed: {e}")
         email_draft = {"subject": "", "body": ""}
 
-    return {"email_draft": email_draft}
-
-
-# ---------------------------
-# STEP 6 — Save Lead
-# ---------------------------
-
-def save_lead(state: LeadState):
-    contact = state.get("contact", {})
-    signal = state.get("current_signal", {})
-    result = state.get("intent_result")
-    email_draft = state.get("email_draft") or {}
-
+    # ── Step 4: Build Lead Dict ───────────────────────────────────
     lead = {
-        "Company Name":       getattr(result, "company_name", "UNKNOWN"),
-        "Contact Name":       contact.get("name", "Not Found"),
-        "Title":              contact.get("title", ""),
-        "LinkedIn URL":       contact.get("linkedin", ""),
-        "Company Website":    contact.get("website", ""),
-        "Email":              contact.get("email", ""),
-        "Email Confidence":   contact.get("confidence", 0),
-        "Email Subject":      email_draft.get("subject", ""),
-        "Email Body":         email_draft.get("body", ""),
-        "Signal Source":      signal.get("Link", ""),
-        "Signal Summary":     getattr(result, "signal_summary", ""),
-        "Intent Score":       getattr(result, "urgency", 0),
-        "Date Found":         datetime.today().strftime("%Y-%m-%d")
+        "Company Name":     result.company_name,
+        "Contact Name":     contact.get("name", "Not Found"),
+        "Title":            contact.get("title", ""),
+        "LinkedIn URL":     contact.get("linkedin", ""),
+        "Company Website":  contact.get("website", ""),
+        "Email":            contact.get("email", ""),
+        "Email Confidence": contact.get("confidence", 0),
+        "Email Subject":    email_draft.get("subject", ""),
+        "Email Body":       email_draft.get("body", ""),
+        "Signal Source":    signal.get("Link", ""),
+        "Signal Summary":   result.signal_summary,
+        "Intent Score":     result.urgency,
+        "Date Found":       datetime.today().strftime("%Y-%m-%d"),
     }
 
-    # Copy the list — never mutate state directly in LangGraph.
-    # Mutating in place means the graph sees the same object reference
-    # and does not register it as a state update, silently dropping leads.
-    existing_leads = list(state.get("leads") or [])
-    existing_leads.append(lead)
-
-    return {"leads": existing_leads}
+    print(f"   ✅ Lead saved: {result.company_name}")
+    return lead
 
 
 # ---------------------------
-# Skip node
+# Excel Export
 # ---------------------------
 
-def skip(state: LeadState):
-    return state
-
-
-# ---------------------------
-# STEP 7 — Export Excel
-# ---------------------------
-
-def export_excel(state: LeadState):
+def export_to_excel(leads: list) -> list:
+    """
+    Merge new leads with existing Excel, deduplicate, save.
+    Returns the final deduped list (what the UI will display).
+    """
     file_path = "data/leads.xlsx"
 
-    if not state.get("leads"):
-        print("ℹ️ No leads found this run")
-        return state
+    if not leads:
+        print("ℹ️ No leads to export")
+        return []
 
-    new_df = pd.DataFrame(state["leads"])
+    new_df = pd.DataFrame(leads)
 
     try:
         os.makedirs("data", exist_ok=True)
@@ -269,12 +149,21 @@ def export_excel(state: LeadState):
         )
 
         combined_df.to_excel(file_path, index=False, engine="openpyxl")
-        print(f"✅ Excel saved. Total leads: {len(combined_df)}")
+        print(f"✅ Excel saved — {len(combined_df)} total leads")
 
-        # Sync state leads to exactly what was saved — this is what app.py reads.
-        # Without this, state has pre-dedup leads while Excel has deduped leads,
-        # causing the UI count to differ from Excel count.
-        state["leads"] = combined_df.to_dict(orient="records")
+        records = combined_df.to_dict(orient="records")
+
+        # Sanitize NaN — pandas converts empty Excel cells to float NaN.
+        # Any NaN in string fields renders as "nan" in the UI text areas.
+        import math
+        def clean(v):
+            if isinstance(v, float) and math.isnan(v):
+                return ""
+            return v
+
+        records = [{k: clean(v) for k, v in row.items()} for row in records]
+
+        return records
 
     except Exception as e:
         print(f"❌ Excel export failed: {e}")
@@ -282,62 +171,103 @@ def export_excel(state: LeadState):
             new_df.to_excel(file_path, index=False, engine="openpyxl")
             print("✅ Fallback: saved new leads only")
         except Exception as e2:
-            print(f"❌ Fallback Excel save also failed: {e2}")
+            print(f"❌ Fallback also failed: {e2}")
 
-    return state
-
-
-# ---------------------------
-# Build Graph
-# ---------------------------
-
-builder = StateGraph(LeadState)
-
-builder.add_node("fetch_signals",     fetch_signals)
-builder.add_node("get_next_signal",   get_next_signal)
-builder.add_node("classify",          classify)
-builder.add_node("find_contact",      find_contact)
-builder.add_node("generate_email",    generate_email_node)
-builder.add_node("save_lead",         save_lead)
-builder.add_node("skip",              skip)
-builder.add_node("export_excel",      export_excel)
-
-builder.set_entry_point("fetch_signals")
-
-builder.add_edge("fetch_signals", "get_next_signal")
-
-builder.add_conditional_edges(
-    "get_next_signal",
-    next_signal_router,
-    {
-        "classify":     "classify",
-        "export_excel": "export_excel"
-    }
-)
-
-builder.add_conditional_edges(
-    "classify",
-    intent_router,
-    {
-        "find_contact": "find_contact",
-        "skip":         "skip"
-    }
-)
-
-# Always generate email after finding contact — no confidence gate
-builder.add_edge("find_contact",   "generate_email")
-builder.add_edge("generate_email", "save_lead")
-builder.add_edge("save_lead",      "get_next_signal")
-builder.add_edge("skip",           "get_next_signal")
-builder.add_edge("export_excel",   END)
-
-graph = builder.compile()
+    return leads
 
 
 # ---------------------------
-# Run
+# Main Pipeline — Parallel
+# ---------------------------
+
+def run_pipeline() -> dict:
+    """
+    Full pipeline with parallel signal processing.
+
+    Old approach: sequential LangGraph loop
+      Signal 1 → classify → contact → email → save
+      Signal 2 → classify → contact → email → save   ← waits for Signal 1
+      ...
+
+    New approach: ThreadPoolExecutor
+      Signal 1 ─┐
+      Signal 2 ─┼─ all run at the same time → collect results → export
+      Signal 3 ─┘
+
+    Each signal is independent — no shared mutable state between threads
+    except CONTACT_CACHE which uses single-key dict writes (GIL-safe).
+
+    Workers = min(signals, 5) to avoid hammering APIs.
+    """
+
+    # ── Fetch all signals ─────────────────────────────────────────
+    try:
+        signals = monitor_signals()
+        print(f"\n📡 Fetched {len(signals)} signals")
+    except Exception as e:
+        print(f"❌ Signal fetch failed: {e}")
+        return {"leads": []}
+
+    if not signals:
+        print("ℹ️ No signals found")
+        return {"leads": []}
+
+    # ── Parallel processing ───────────────────────────────────────
+    leads      = []
+    workers    = min(len(signals), 5)   # cap at 5 to respect API rate limits
+
+    print(f"🚀 Processing {len(signals)} signals in parallel (workers: {workers})\n")
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+
+        # Submit all signals at once
+        future_to_signal = {
+            executor.submit(process_signal, signal): signal
+            for signal in signals
+        }
+
+        # Collect results as they complete
+        for future in as_completed(future_to_signal):
+            signal = future_to_signal[future]
+            try:
+                lead = future.result()
+                if lead is not None:
+                    leads.append(lead)
+            except Exception as e:
+                print(f"❌ Signal processing crashed: {signal.get('Title', '')[:40]} — {e}")
+
+    print(f"\n📊 {len(leads)} YES leads found from {len(signals)} signals")
+
+    # ── Persist cache after all threads finish ────────────────────
+    save_cache(CONTACT_CACHE)
+
+    # ── Export to Excel ───────────────────────────────────────────
+    final_leads = export_to_excel(leads)
+
+    return {"leads": final_leads}
+
+
+# ---------------------------
+# LangGraph-compatible wrapper
+# app.py calls graph.invoke({}) — keep that interface working
+# ---------------------------
+
+class _FakeGraph:
+    """
+    Thin wrapper so app.py can keep calling graph.invoke({})
+    without any changes.
+    """
+    def invoke(self, _state: dict) -> dict:
+        return run_pipeline()
+
+
+graph = _FakeGraph()
+
+
+# ---------------------------
+# Run directly
 # ---------------------------
 
 if __name__ == "__main__":
-    result = graph.invoke({})
-    print(f"\n✅ Pipeline complete. Leads found: {len(result.get('leads', []))}")
+    result = run_pipeline()
+    print(f"\n✅ Pipeline complete. Leads: {len(result.get('leads', []))}")

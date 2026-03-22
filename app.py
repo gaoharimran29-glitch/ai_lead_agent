@@ -7,7 +7,8 @@ import io
 from datetime import datetime
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-from main import graph
+from main import graph, run_pipeline
+from agents.intent_classifier import generate_email
 
 # ---------------------------
 # Page Config
@@ -498,34 +499,66 @@ if st.session_state.leads:
                 unsafe_allow_html=True
             )
 
-        # Email preview
-        subject = lead.get("Email Subject", "")
-        body = lead.get("Email Body", "")
+        # Email preview — always shown, always has real LLM content
+        # Sanitize NaN — pandas read_excel turns empty cells into float NaN
+        raw_subject = lead.get("Email Subject", "")
+        raw_body    = lead.get("Email Body", "")
 
-        if subject or body:
-            with st.expander("📩 View Email Draft", expanded=False):
+        def is_empty(v):
+            """True if value is empty, whitespace, or NaN."""
+            import math
+            if v is None:
+                return True
+            if isinstance(v, float) and math.isnan(v):
+                return True
+            return str(v).strip() in ("", "nan", "NaN", "None")
 
-                # Editable subject
-                new_subject = st.text_input(
-                    "Subject",
-                    value=subject,
-                    key=f"subj_{i}",
-                    label_visibility="collapsed",
-                    placeholder="Subject line..."
-                )
+        subject = "" if is_empty(raw_subject) else str(raw_subject)
+        body    = "" if is_empty(raw_body)    else str(raw_body)
 
-                # Editable body
-                new_body = st.text_area(
-                    "Email body",
-                    value=body,
-                    height=200,
-                    key=f"body_{i}",
-                    label_visibility="collapsed"
-                )
+        # If email is missing — generate it now via LLM so user always sees real content
+        if not subject or not body:
+            with st.spinner(f"✍️ Writing email for {lead.get('Company Name', '')}..."):
+                try:
+                    draft = generate_email({
+                        "Company Name":   lead.get("Company Name", "the company"),
+                        "Contact Name":   lead.get("Contact Name", "there"),
+                        "Title":          lead.get("Title", "Leader"),
+                        "Signal Summary": lead.get("Signal Summary", "recent news"),
+                        "Intent Score":   lead.get("Intent Score", 5),
+                    })
+                    subject = draft.get("subject", "") or f"Quick note on {lead.get('Company Name', '')}"
+                    body    = draft.get("body", "")
+                except Exception as e:
+                    st.warning(f"⚠️ Could not generate email: {e}")
+                    subject = f"Quick note on {lead.get('Company Name', '')}"
+                    body    = ""
 
-                # Update lead with any edits
-                st.session_state.leads[i]["Email Subject"] = new_subject
-                st.session_state.leads[i]["Email Body"] = new_body
+            # Persist back so next render doesn't regenerate
+            st.session_state.leads[i]["Email Subject"] = subject
+            st.session_state.leads[i]["Email Body"]    = body
+
+        with st.expander("📩 Email Draft", expanded=True):
+
+            new_subject = st.text_input(
+                "Subject",
+                value=subject,
+                key=f"subj_{i}",
+                label_visibility="collapsed",
+                placeholder="Subject line..."
+            )
+
+            new_body = st.text_area(
+                "Email body",
+                value=body,
+                height=220,
+                key=f"body_{i}",
+                label_visibility="collapsed"
+            )
+
+            # Persist edits back to session state
+            st.session_state.leads[i]["Email Subject"] = new_subject
+            st.session_state.leads[i]["Email Body"]    = new_body
 
         # Send button / status
         st.markdown("<div style='margin-top: 12px;'>", unsafe_allow_html=True)
